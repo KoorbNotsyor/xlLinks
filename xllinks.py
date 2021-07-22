@@ -4,33 +4,25 @@
 # -------------------------------------------------------------------------------------------------------
 # 1.0 A useful project to learn Python and Git, GitHub
 #
-# TODO version 2.0 extract urls from any text based file
+# 2.0 Simplify .lnx file only ith .htm, .html entries and handle timeouts more sensibly
 #
+# TODO version 2.0+ extract urls from any text based file
+#
+
 # -------------------------------------------------------------------------------------------------------
 # xLinks.py - add each link in given file to specified excel workbook/sheet
 #
 #  A .lnx file contains csv formatted lines of:
 #
-# a) file.htm or file.html
+#           <path>/file.htm or <path>/file.html
 #
-#    containing one or more  <a href="https://www.w3schools.com">Visit W3Schools.com!</a>  links to process
-#
-# b) a direct reference to a link
-#
-#     starting with 'http://' or 'https://'
-#
-# c) a reference to a url of a web page
-#
-#    containing one or more  <a href="https://www.w3schools.com">Visit W3Schools.com!</a>  links to process
-#
-#    format: WWWW, <url> starting with 'http://' or 'https://'
-#
-# d) a nested reference to a .lnx file
-#
-#    format: @->,<filename.lnx>
+#    each containing one or more  <a href="https://www.w3schools.com">Visit W3Schools.com!</a>  links to process
 #
 # If the workbook/sheet specified does not exist create it... Enforce/check the format of the
 # sheet (e.g. some magic number in a cell).
+#
+# If a link cannot be succesfully processed e.g. timeout the link is written to output file 'unprocessed.lnx' in
+# same path as input .lnx file
 #
 # -------------------------------------------------------------------------------------------------------------
 # TODO display raw content from url (for debug/interest)
@@ -56,7 +48,7 @@ import logging
 
 usage = '''
 - Usage:
--        py.exe links.py <links filename> <target xlsx> <sheet name>
+-        py.exe xllinks.py <links filename> <target xlsx> <sheet name>
 -
 -           <links filename> must end with '.lnx'
 '''
@@ -108,14 +100,11 @@ class xlHandle:
         self.wb = None
         self.ws = None
         self.columnData = {}
-        self.headerRow = False
+        self.headerRow = True
 
 
     def setupWorkbook(self):
         self.wb, self.ws = setupWorkbook(self, self.wbPath, self.wsName)
-
-    def setHeaderRow(self, tf):
-        self.headerRow = tf
 
 
     def recordColumnMaxWidth(self, colNo, colWidth): # for given column set/reset maximum width
@@ -182,7 +171,12 @@ class xlHandle:
             self.adjustColumnWidths()
 
 
-    def closeWorkbook(self):
+    def saveWorkbook(self):
+        if self.wb is not None:
+            self.finishWorkbook()
+            self.wb.save(self.wbPath)
+
+    def closeWorkbook(self): # same as saveWorkbook plus...?
         if self.wb is not None:
             self.finishWorkbook()
             self.wb.save(self.wbPath)
@@ -260,7 +254,8 @@ def setupWorksheet(xlH, ws):  # application specific worksheet code
     ws['F1'] = 'Title'
     ws['G1'] = 'Date entered'
     ws.freeze_panes = ws['A2']
-    xlH.setHeaderRow(True)
+
+    logging.info('setup worksheet:max row={0}'.format(ws.max_row))
 
 
 def addLink(xlH, theGroup, theLink, theTitle, theResultCode, theResultReason):  # application specific worksheet code
@@ -280,11 +275,23 @@ def addLink(xlH, theGroup, theLink, theTitle, theResultCode, theResultReason):  
     now = datetime.datetime.now()
     ws['G' + str(nextRow)] = now.strftime("%Y-%m-%d-%H-%M-%S")
 
+def addToDump(unprocessed, line):
+    upf = open(unprocessed,"a")
+    upf.write(line+'\n')
+    upf.close()
+
+def stamp(stampfile, message):
+    sf = open(stampfile,"w")
+    now = datetime.datetime.now()
+    timestamp = now.strftime("%Y-%m-%d-%H-%M-%S") + ' ' + message + '\n'
+    sf.write(timestamp)
+    sf.close()
+
 def checkUrl(url):
 
     # check url and catch Request exceptions , convert to 'error' string
 
-    timeoutSeconds = 4
+    timeoutSeconds = 10
 
     start_time = got_time = end_time = 0
 
@@ -292,7 +299,7 @@ def checkUrl(url):
 
     rescode = 0
     reason = '?'
-    title = '-? PROBLEM WITH LINK ?-'
+    title = '?'
 
     try:
 
@@ -315,19 +322,22 @@ def checkUrl(url):
         title = slop.find('title').get_text(strip=True)
 
     except TimeoutError as e:
-        logging.info('Time out exception [{0}][{1}][timeout = {2}s]'.format(e, url, timeoutSeconds))
+        reason = 'Time out exception [{0}][{1}][timeout = {2}s]'.format(e, url, timeoutSeconds)
+        logging.info(reason)
         rescode = 0
-        reason = 'request timeout'
-        title = 'TIMED OUT!!!'
+        title = '- TIME OUT -'
 
     except requests.exceptions.RequestException as e:
-        logging.info('Request Exception [{0}][{1}]'.format(e, url))
+        reason = 'Request Exception [{0}][{1}]'.format(e, url)
+        logging.info(reason)
         if rescode == 0: # Request exception with no HTTP status code set...
-            reason = 'possible timeout, retry count exceeded'
-            title = '-? POSSIBLE TIME OUT ?-'
+            title = '-? POSSIBLE TIME OUT retry count exceeded ?-'
 
     except Exception as e:
-       logging.info('Exception [{0}][{1}]'.format(e, url))
+        reason = 'Exception [{0}][{1}]'.format(e, url)
+        logging.info(reason)
+        rescode = 0
+        title = '- PROBLEM -'
 
     end_time = time.perf_counter()
 
@@ -355,15 +365,7 @@ def nextEmbeddedLink(soup):
         if href.startswith('http://') or href.startswith('https://'):
             yield href
 
-def processURL(xlH,url):
-    logging.info('Processing URL [{0}]...'.format(url))
-    response = requests.get(url)
-    response.raise_for_status()
-    soup = bs4.BeautifulSoup(response.text, bs4_parser)
-    for link in nextEmbeddedLink(soup):
-        processLink(xlH,link)
-
-def processHTML(xlH,htmlFile):
+def processHTML(xlH, htmlFile, unprocessed, stampfile):
 
     # given HTML file name (hopefully)... TODO check if html, UTF-8  ?
     if os.path.isfile(htmlFile):
@@ -372,41 +374,47 @@ def processHTML(xlH,htmlFile):
         fp = open(htmlFile, encoding='utf-8', errors='backslashreplace')
         soup = bs4.BeautifulSoup(fp, bs4_parser)
         for link in nextEmbeddedLink(soup):
-            processLink(xlH, link)
+            processLink(xlH, link, unprocessed, stampfile)
         fp.close()
     else:
         print('Processing HTML FILE [{0}] -- NO SUCH FILE --'.format(htmlFile))
 
-def processLink(xlH, link, _static={'counter': 0}):
+def processLink(xlH, link, unprocessed, stampfile, _static={'counter': 0}):
 
     _static['counter'] += 1
+    modval1000 = _static['counter'] % 1000
 
     rescode, reason, title = checkUrl(link)
 
-    # Append to the specified workbook/sheet...
-    addLink(xlH, 'UNCLASSIFIED', link, title, rescode, reason)
+    # defend against unknwown events...  occasionally save workbook in case
+    if modval1000 == 0:
+        xlH.saveWorkbook()
 
-    logging.info('{3:4d} Result [{1} {4}] Link [{0}] Title[{2}]'.format(link, rescode, title, _static['counter'], reason))
+    # Append to the specified workbook/sheet...
+    if rescode == 200:
+        addLink(xlH, 'UNCLASSIFIED', link, title, rescode, reason)
+    else:
+        addToDump(unprocessed,'{0} {1}'.format(link,rescode))
+
+    if rescode  != 200:
+        logging.info('{3:4d} Result [{1} {4}] Link [{0}] Title[{2}]'.format(link, rescode, title, _static['counter'], reason))
+
+    stamp(stampfile,'{0:4d}'.format(_static['counter']))
 
     return 0
 
-def processLNXFile(xlH,lnxFile):
+def processLNXFile(xlH, lnxFile, unprocessed, stampfile):
 
     if lnxFile.endswith('.lnx') and os.path.isfile(lnxFile):
         logging.info('Processing LNX FILE [{0}]...'.format(lnxFile))
         with open(lnxFile, mode='r') as csv_file:
             csv_reader = csv.DictReader(csv_file, fieldnames=["col0", "col1"], restval='')
             for row in csv_reader:
-                col0 = row['col0']
-                if col0.startswith('WWWW'):
-                    processURL(xlH,row['col1'])
-                elif col0.startswith('@->'):
-                    processLNXFile(xlH, row['col1'])
-                elif col0.startswith('http://') or col0.startswith('https://'):
-                    processLink(xlH, col0)
-                elif col0.endswith('.htm') or col0.endswith('.html'):
-                    processHTML(xlH, col0)
-
+                col0 = row['col0'].strip()
+                if col0.endswith('.htm') or col0.endswith('.html'):
+                    processHTML(xlH, col0, unprocessed, stampfile)
+                else:
+                    logging.info('Processing LNX FILE [{0}] -- unknown entry --'.format(col0))
             csv_file.close()
     else:
         logging.info('Processing LNX FILE [{0}] -- NO SUCH FILE --'.format(lnxFile))
@@ -421,9 +429,12 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
-    links = sys.argv[1].lower()
+    links = sys.argv[1]
     xlfile = sys.argv[2]
     xlsheet = sys.argv[3]
+
+    unprocessed = os.path.dirname(os.path.abspath(links))+os.path.sep+'unprocessed.lnx'
+    stampfile = os.path.dirname(os.path.abspath(links))+os.path.sep+'stamp'
 
     xlH = xlHandle(xlfile, xlsheet)
     try:
@@ -435,7 +446,7 @@ def main():
             if os.path.isfile(links):
 
                 if xlH.ws is not None:
-                    processLNXFile(xlH, links)
+                    processLNXFile(xlH, links, unprocessed, stampfile)
 
             else:
                 logging.info('Processing LNX FILE [{0}] -- NO SUCH FILE --'.format(links))
@@ -444,7 +455,7 @@ def main():
             printUsage()
 
     except requests.exceptions.RequestException as e:
-        logging.error('!!! requests exception !!! [{0}]'.format(e))
+        logging.error('!!! Requests exception !!! [{0}]'.format(e))
     except UnicodeError as e:
         logging.error('!!! UNICODE ERROR !!! [{0}]'.format(e))
     except Exception as e:
@@ -454,6 +465,8 @@ def main():
 
     del xlH
 
+    stamp(stampfile,'DONE')
+    
     return 0
 
 
